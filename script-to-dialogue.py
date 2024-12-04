@@ -1,6 +1,8 @@
 import os
+import json
 from pathlib import Path
-from openai import OpenAI
+import requests
+import base64
 from pydub import AudioSegment
 
 API_ENDPOINT = "https://api.openai.com/v1/chat/completions"
@@ -10,7 +12,10 @@ API_KEY = os.getenv("WHOSELINE_OPENAI_API_KEY")
 if not API_KEY:
     raise ValueError("API key not found. Please set the WHOSELINE_OPENAI_API_KEY environment variable.")
 
-client = OpenAI(api_key=API_KEY)
+HEADERS = {
+    "Authorization": f"Bearer {API_KEY}",
+    "Content-Type": "application/json"
+}
 
 BOLD = '\033[1m'
 UNDERLINE = '\033[4m'
@@ -20,15 +25,8 @@ END = '\033[0m'
 
 voices = ["alloy", "echo", "fable", "onyx", "nova", "shimmer"]
 
-# Conversation script
-script = [
-    {"actor": 4, "line": "Hei, takk for sist"},
-    {"actor": 5, "line": "Takk for sist, ja."},
-    {"actor": 4, "line": "Ja, i dag er det cøliakikontroll"},
-    {"actor": 5, "line": "Ja.."},
-    {"actor": 4, "line": "Så, hvordan går det?"},
-    {"actor": 5, "line": "Jo, jeg synes det går greit. Det har vært litt mye å sette seg inn i, men det har blitt lettere etter hvert."}
-]
+# Path to the JSON file containing the dialogue
+DIALOG_FILE = Path(__file__).parent / "script.json"
 
 # Directory to save temporary audio files
 TEMP_DIR = Path(__file__).parent / "temp_audio"
@@ -37,15 +35,47 @@ TEMP_DIR.mkdir(parents=True, exist_ok=True)
 # Output file path
 OUTPUT_FILE = Path(__file__).parent / "conversation.mp3"
 
-def generate_audio(client, line, voice, file_path):
-    response = client.audio.speech.create(
-        model="tts-1-hd",
-        voice=voice,
-        input=line,
-        
-    )
+def load_dialog_from_file(file_path):
+    """
+    Load dialog from a JSON file.
+    """
+    with open(file_path, "r", encoding="utf-8") as f:
+        return json.load(f)
 
-    response.with_streaming_response(file_path)
+def merge_consecutive_lines(dialog):
+    """
+    Merge consecutive lines where the same actor speaks multiple times in a row.
+    """
+    merged_dialog = []
+    for entry in dialog:
+        if merged_dialog and merged_dialog[-1]["actor"] == entry["actor"]:
+            # Merge lines if the actor is the same as the previous one
+            merged_dialog[-1]["line"] += f" {entry['line']}"
+        else:
+            # Add a new entry if the actor changes
+            merged_dialog.append(entry)
+    return merged_dialog
+
+def generate_audio(line, voice, file_path):
+    data = {
+        "model": AUDIO_MODEL,
+        "modalities": ["text", "audio"],
+        "audio": {"voice": voice, "format": "mp3"},
+        "messages": [
+            {
+                "role": "user",
+                "content": f"Følgende replikk er en del av en dialog. Les opp replikken på norsk slik at den kan kombineres med resten av dialogen. Ikke les opp noe annet enn følgende:{line}"
+            }
+        ]
+    }
+
+    response = requests.post(API_ENDPOINT, headers=HEADERS, json=data)
+    response.raise_for_status()
+
+    audio_data_base64 = response.json()["choices"][0]["message"]["audio"]["data"]
+
+    with open(file_path, 'wb') as f:
+        f.write(base64.b64decode(audio_data_base64))
 
 def create_conversation(script):
     """
@@ -60,7 +90,7 @@ def create_conversation(script):
         temp_file_path = TEMP_DIR / f"line_{idx + 1}.mp3"
         
         # Generate audio for the line
-        generate_audio(client, entry["line"], voices[entry['actor']], temp_file_path)
+        generate_audio(entry["line"], voices[entry['actor']], temp_file_path)
         
         # Load audio and append to combined_audio
         line_audio = AudioSegment.from_file(temp_file_path, format="mp3")
@@ -71,4 +101,8 @@ def create_conversation(script):
     print(f"Conversation audio, duration {combined_audio.duration_seconds}s, saved as {OUTPUT_FILE}")
 
 if __name__ == "__main__":
+    # Load dialogue from file
+    raw_script = load_dialog_from_file(DIALOG_FILE)
+    # Merge consecutive lines for the same actor
+    script = merge_consecutive_lines(raw_script)
     create_conversation(script)
